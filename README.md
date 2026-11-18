@@ -11,6 +11,7 @@ Contents
 - Read requests
 - Keep-alive
 - Migrating from previous versions and backwards compatability
+- Connecting on the local network
 - Connecting to the VRM MQTT servers
 - Building
 
@@ -18,9 +19,9 @@ Introduction
 ------------
 dbus-flashmq is the plugin that makes FlashMQ, the MQTT Broker used on Venus OS, a D-Bus aware MQTT broker. It also supports receiving requests to change values on the local D-Bus. It's a faster replacement for the original Python dbus-mqtt. And, because it integrated with FlashMQ's event loop, it can coordinate dbus and mqtt activity as efficiently as possible.
 
-FlashMQ with this plugin runs as a service since [Venus OS](https://github.com/victronenergy/venus/wiki) version 3.20. To enable the MQTT service, go to 'Settings -> Services -> MQTT' on the menus of the GX device.
+FlashMQ with this plugin runs as a service since [Venus OS](https://github.com/victronenergy/venus/wiki) version 3.20. To enable MQTT on the local network, go to 'Settings -> Integrations -> MQTT Access' on the menus of the GX device.
 
-dbus-flashmq runs inside the FlashMQ broker. FlashMQ is accessible on the local network at TCP port 1883 and/or 8883 (depending on your security settings). Furthermore, MQTT traffic can be configured to be forwarded to the central Victron VRM MQTT broker farm. For further details, see the [Connecting to the VRM MQTT servers](#connecting-to-the-vrm-mqtt-servers) chapter below.
+dbus-flashmq runs inside the FlashMQ broker. FlashMQ is accessible on the local network on several ports, depending on your security settings; see [Connecting on the local network](#connecting-on-the-local-network). Furthermore, MQTT traffic can be configured to be forwarded to the central Victron VRM MQTT broker farm. For further details, see the [Connecting to the VRM MQTT servers](#connecting-to-the-vrm-mqtt-servers) chapter below.
 
 
 Support
@@ -221,6 +222,58 @@ etc
 ```
 
 The previous implementation serialized all the answers as json.
+
+Connecting on the local network
+-------------------------------
+
+Which ports are open depends on 'Settings -> Integrations -> MQTT Access' (Off, Paired devices only, or On) and on 'Settings -> General -> Access & Security -> Local network security profile' (Secured, Weak or Unsecured). On a new GX device, the user must choose a security profile first. Tokens need Venus OS v3.70 or later; pairing mode and 'Paired devices only', v3.80 or later.
+
+| Port | What | Open when |
+|------|------|-----------|
+| 443, path `/websocket-mqtt` | MQTT over secure websocket, via the web server | Always, whatever MQTT Access is set to |
+| 8883 | MQTT over TLS | MQTT Access 'On', or 'Paired devices only' with at least one paired device |
+| 80, path `/websocket-mqtt` | MQTT over plain websocket, via the web server | Security profile Weak or Unsecured |
+| 1883, 9001 | Plain MQTT, plain websocket | MQTT Access 'On' and security profile Weak or Unsecured |
+
+Ports 443 and 8883 each have their own self-signed certificate, both with CN `venus.local`. Pin each one on first use: they normally stay the same until the data partition is wiped, such as by a factory reset, which also deletes the tokens. The one on 8883 is also replaced if it is found invalid when the broker starts, such as when the clock of the GX device is set to before the date it was made. On its own Wi-Fi access point, the GX device is at 172.24.24.1.
+
+### Logging in
+
+- **Port 443 or 80 (websocket via the web server):** the web server checks the login, with the same session cookie as the Remote Console in a browser. A client first POSTs `password=<security profile password>` to `/auth/login.php`: success is a 303 with a `VENUS_SESSION_ID` cookie, to send with the websocket upgrade; otherwise it gets the login form again (200). Tokens can't be used here. With security profile Unsecured, no login is needed.
+- **Port 8883, 1883 or 9001 with the security profile password:** any username that doesn't start with `token/`, and the security profile password. Only with MQTT Access 'On'. With security profile Unsecured, no password is needed.
+- **Port 8883, 1883 or 9001 with a token:** username `token/<role>/<device_id>`, with the token's password. Also on 8883 with MQTT Access 'Paired devices only'. A token always needs its password, whatever the security profile. It gives the same access as the security profile password, except that it can't change the security profile or its password, start pairing mode or remove tokens.
+
+Wrong passwords lock out logins with the security profile password, also with the right password; tokens are never locked out:
+
+- On ports 8883, 1883 and 9001: after 20 different wrong passwords in quick succession, one more is allowed per second; after 150 different wrong passwords within the 24 hours since the GX device started or last reset this count, none until those 24 hours are over. A refused login is answered after 1 to 6 seconds.
+- On the web server (`/auth/login.php`, and `/auth/generate-token/` with a password, below): after 10 wrong passwords, for 2 minutes, doubling up to 64 minutes with each further wrong password. This also blocks new logins to the Remote Console in the browser; a browser that is already logged in keeps working. A right password, 24 hours without a wrong one, or a restart of the GX device ends it.
+
+### Pairing a device
+
+A device of your own should use a token, so the user doesn't have to give it the security profile password:
+
+1. The user puts the GX device in pairing mode: 'Settings -> Integrations -> MQTT devices -> Pairing mode', or by pressing the button on the GX device, such as on a Cerbo GX, twice within 1.5 seconds. Pairing mode stays open for 2 minutes; the Bluetooth LED blinks fast meanwhile. Note that a single press of that button turns the Wi-Fi access point and Bluetooth on or off.
+2. Within those 2 minutes, the device asks for a token, over https only:
+
+   ```sh
+   curl --insecure -d 'role=<role>&device_id=<device_id>' 'https://<ipaddress/hostname>/auth/generate-token/'
+   ```
+
+   `role` is your type of product, and `device_id` is unique for each unit, such as its serial number. Both may contain only letters, digits and underscores. The answer is:
+
+   ```json
+   {"token_name":"token/<role>/<device_id>","password":"<32 characters>"}
+   ```
+
+   Store both: the password is not shown again. A new request for the same name replaces the token: new logins with the old password are refused, but a connection that is already open stays open.
+3. The device logs in with `token_name` as username and `password` as password, on port 8883. The GX device adds the token a moment after answering, so retry for a few seconds if the first login is refused. If logins keep being refused later, the token was removed or the GX device was reset: pair again.
+
+Outside pairing mode, a token can be made with the security profile password: add `--user 'remoteconsole:<password>'` to the curl command (with security profile Unsecured: `--user 'remoteconsole:'`). Without it, the answer is 403.
+
+Pairing works even with MQTT Access 'Off': the first token sets it to 'Paired devices only', and removing the last one sets it back to 'Off'. Turning MQTT Access 'Off' disconnects paired devices until it is turned on again.
+
+Paired devices are listed on 'Settings -> Integrations -> MQTT devices', with their role (or product name, for roles the GUI knows) and device_id, where the user can remove them; removing one also drops its connections. The GX device announces that it supports pairing as `_victronenergy_http_pairing._tcp` over mDNS (DNS-SD), and with `X_MqttTokenPairing` in its UPnP (SSDP) description, so a device can find it without knowing its IP address.
+
 
 Connecting to the VRM MQTT servers
 -------------------------------------
